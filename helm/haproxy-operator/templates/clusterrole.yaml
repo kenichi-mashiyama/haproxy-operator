@@ -4,6 +4,22 @@ metadata:
   name: {{ .Values.name }}
 rules:
   - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - get
+      - list
+      - watch
+      - delete
+  - apiGroups:
+      - batch
+    resources:
+      - jobs/status
+    verbs:
+      - get
+  - apiGroups:
       - config.haproxy.com
     resources:
       - '*'
@@ -22,6 +38,7 @@ rules:
     verbs:
       - get
       - list
+      - patch
       - watch
   - apiGroups:
       - proxy.haproxy.com

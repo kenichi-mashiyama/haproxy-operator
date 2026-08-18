@@ -1197,6 +1197,16 @@ Package v1alpha1 contains API Schema definitions for the proxy v1alpha1 API grou
 ### Resource Types
 - [Instance](#instance)
 
+### Configuration Validation
+
+Before the runtime HAProxy configuration Secret is updated, the operator validates the generated configuration. A failed validation sets the `Instance` status phase to `InternalError` and records the validation error. Validation failures do not request an immediate reconciliation retry.
+
+Only validation timeouts are retried, and only once: after the initial attempt times out, the operator waits 30 seconds and creates one new validation Job. If that retry also times out, validation fails without further retries. The retry uses a distinct Job name; the timed-out Job is deleted and its deletion awaited before the retry. HAProxy configuration errors and other non-timeout failures are not retried. With the 120-second Job deadline, the validation sequence can take up to approximately 4 minutes 30 seconds, excluding Kubernetes scheduling and deletion delays.
+
+After all timeout attempts are exhausted, the timeout result is cached for the current Instance and owned configuration-resource generations so status-driven reconciliations do not start another retry cycle. A later generation change permits validation again even if the generated configuration bytes are unchanged. The generations are captured from the same resource snapshot that the configuration is generated from, before the operator updates resource statuses, so a resource change that lands in the middle of a reconciliation does not cause the previously timed-out configuration to be validated again; the change is validated by the following reconciliation. An ordinary validation failure is cached for the generated configuration hash.
+
+Set the `proxy.haproxy.com/force-revalidation: "true"` annotation on an `Instance` to clear the cached result and request fresh validation. The annotation is consumed after the cache is cleared. On validation Job failure, the operator logs the associated Pod name for `kubectl logs` inspection. Failed validation Jobs are logged at the `error` level with `job` and `pod` fields. Successful validation Jobs are logged at the `info` level with the message `HAProxy config validation job succeeded` and `job` and `pod` fields; the controller log context includes the `Instance` and namespace. When the initial validation attempt times out, the operator logs `HAProxy config validation timed out, retrying` at the `info` level with the timed-out `job` and the `retryAfter` delay before creating the retry Job. When the retry also times out, the operator logs `HAProxy config validation timed out after retry, giving up` at the `error` level with the last `job`, the total `attempts` (initial attempt included), and the timeout error. These timeout logs are not emitted when validation stops because the reconciliation context is cancelled.
+
 
 
 #### Configuration
@@ -1578,3 +1588,27 @@ _Appears in:_
 | `annotations` _object (keys:string, values:string)_ | Annotations to be added to Service. |  | Optional: \{\} <br /> |
 
 
+
+## HAProxy Config Precheck Logging
+
+The short-lived configuration validation Job (`haproxy -c`) discards the HAProxy
+process' stdout/stderr; only its exit code determines Job success/failure. No
+HAProxy configuration detail (certificate paths, ACL values, backend addresses,
+line numbers, ...) is written to the Job Pod log.
+
+The Operator only emits the following, unrelated to the check's log content:
+- `level=info` on success: message, `job`, `pod`.
+- `level=error` on failure: message, `job`, `pod`.
+
+`Job.Status.Conditions[].Message` for a failed Job is not propagated into the
+returned validation error; a fixed message (`haproxy config validation job
+failed`) is used instead, since that field could otherwise echo container
+output.
+
+The validation Job is configured with `activeDeadlineSeconds: 120` (2 minutes)
+and `ttlSecondsAfterFinished: 60` (1 minute), ensuring that hung jobs (e.g.,
+stuck in ImagePullBackOff or Pending) are terminated by Kubernetes as `Failed`
+after 2 minutes and automatically cleaned up by the TTL controller.
+
+This behavior is a fixed policy and is not configurable via the `Instance`
+CRD.

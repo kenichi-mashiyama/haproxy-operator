@@ -78,6 +78,22 @@ This example will guide you through the process of setting up a basic HAProxy in
 
 For a more in-depth understanding of the HAProxy Operator and to explore complex use cases, refer to the upcoming sections in this documentation. These sections will provide detailed explanations, advanced examples, and configuration options to help you tailor the HAProxy solution to your specific requirements.
 
+### Configuration Validation Before Secret Update
+
+Before the operator updates the runtime configuration `Secret` (`<instance>-haproxy-config`), it validates the generated `haproxy.cfg` with a short-lived Kubernetes `Job`:
+
+1. Build the generated `haproxy.cfg` and all referenced certificate/config files.
+2. Create a temporary validation `Secret`.
+3. Start a short-lived `Job` using the same image as the target HAProxy instance (`spec.image`, fallback `haproxy:latest`) and run:
+  ```
+  haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+  ```
+4. If validation succeeds, update the runtime configuration `Secret`.
+5. If validation fails, do not update the runtime configuration `Secret` and set `Error` status on the `Instance` and related configuration resources.
+6. Clean up temporary validation resources (`Job` and `Secret`) automatically (TTL) and explicitly by the operator.
+
+Development rule: when changing how runtime config secret data is assembled, update both the validation payload builder and the runtime secret write path together.
+
 ### HAProxy Instance (proxy.haproxy.com/v1alpha1)
 
 An HAProxy instance refers to a single running instance of the HAProxy service. This service can be configured to manage the load balancing and distribution of network traffic among a set of servers or backends within or external to a Kubernetes cluster.
