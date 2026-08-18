@@ -24,6 +24,7 @@ import (
 type Reconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	ConfigValidator ConfigValidator
 }
 
 //+kubebuilder:rbac:groups=proxy.haproxy.com,resources=instances,verbs=get;list;watch;create;update;patch;delete
@@ -77,6 +78,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var checksum string
 
 	if checksum, err = r.reconcileConfig(ctx, instance, listens, frontends, backends, resolvers); err != nil {
+		if isNonRetryableValidationError(err) {
+			return reconcile.Result{}, r.updateInstanceErrorStatusIfChanged(ctx, instance, err)
+		}
+
 		return reconcile.Result{}, r.handleError(ctx, instance, err)
 	}
 
@@ -129,6 +134,24 @@ func (r *Reconciler) handleError(ctx context.Context, instance *proxyv1alpha1.In
 	}
 
 	return multierr.Combine(err, r.Status().Update(ctx, instance))
+}
+
+func (r *Reconciler) updateInstanceErrorStatusIfChanged(ctx context.Context, instance *proxyv1alpha1.Instance, err error) error {
+	if instance == nil || err == nil {
+		return nil
+	}
+
+	errMsg := err.Error()
+	if instance.Status.Phase == proxyv1alpha1.InstancePhaseInternalError && instance.Status.Error == errMsg {
+		return nil
+	}
+
+	instance.Status = proxyv1alpha1.InstanceStatus{
+		Phase: proxyv1alpha1.InstancePhaseInternalError,
+		Error: errMsg,
+	}
+
+	return r.Status().Update(ctx, instance)
 }
 
 func (r *Reconciler) patchPods(ctx context.Context, instance *proxyv1alpha1.Instance, checksum string) error {

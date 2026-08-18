@@ -5,8 +5,10 @@ import (
 	// #nosec
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -22,6 +24,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	forceRevalidationAnnotationKey = "proxy.haproxy.com/force-revalidation"
+	validationHashAnnotationKey    = "proxy.haproxy.com/last-validation-hash"
+	validationStateAnnotationKey   = "proxy.haproxy.com/last-validation-state"
+	validationErrorAnnotationKey   = "proxy.haproxy.com/last-validation-error"
+	validationStateSuccessful      = "successful"
+	validationStateFailed          = "failed"
+	defaultValidationFailureError  = "haproxy config validation job failed"
 )
 
 func (r *Reconciler) reconcileConfig(ctx context.Context, instance *proxyv1alpha1.Instance, listens *configv1alpha1.ListenList, frontends *configv1alpha1.FrontendList, backends *configv1alpha1.BackendList, resolvers *configv1alpha1.ResolverList) (string, error) {
@@ -58,7 +70,44 @@ func (r *Reconciler) reconcileConfig(ctx context.Context, instance *proxyv1alpha
 	}
 
 	aclValueFiles := r.generateACLValuesFiles(ctx, listens, frontends, backends)
+	// Keep validation payload in sync with runtime secret assembly below.
+	validationData := buildConfigSecretData(instance, config, certificates, envs, mappings, errorFiles, customCerts, aclValueFiles)
+	validationHash := validationDataHash(validationData)
 
+	if err := r.clearForcedValidationState(ctx, instance); err != nil {
+		return "", err
+	}
+
+	if state, sameHash := getValidationState(instance, validationHash); sameHash {
+		if state == validationStateFailed {
+			validationErr := getValidationError(instance)
+			if validationErr == "" {
+				validationErr = defaultValidationFailureError
+			}
+
+			err = newNonRetryableValidationError(errors.New(validationErr))
+			errStatus := r.markRelatedConfigError(ctx, instance, listens, frontends, backends, resolvers, err)
+			return "", multierr.Combine(err, errStatus)
+		}
+
+		if state == validationStateSuccessful {
+			goto writeSecret
+		}
+	}
+
+	err = r.configValidator().Validate(ctx, ConfigValidationRequest{Instance: instance, Data: validationData})
+	if err != nil {
+		persistErr := r.setValidationState(ctx, instance, validationHash, validationStateFailed, err.Error())
+		err = newNonRetryableValidationError(err)
+		errStatus := r.markRelatedConfigError(ctx, instance, listens, frontends, backends, resolvers, err)
+		return "", multierr.Combine(err, errStatus, persistErr)
+	}
+
+	if err := r.setValidationState(ctx, instance, validationHash, validationStateSuccessful, ""); err != nil {
+		return "", err
+	}
+
+		writeSecret:
 	configSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      utils.GetConfigSecretName(instance),
@@ -70,6 +119,7 @@ func (r *Reconciler) reconcileConfig(ctx context.Context, instance *proxyv1alpha
 			return err
 		}
 
+		// NOTE: Keep this block in sync with buildConfigSecretData used for validation.
 		configSecret.Data = map[string][]byte{
 			filepath.Base(haproxy.DefaultConfigurationFile): []byte(config),
 		}
@@ -116,6 +166,156 @@ func (r *Reconciler) reconcileConfig(ctx context.Context, instance *proxyv1alpha
 	}
 
 	return checksum, nil
+}
+
+func (r *Reconciler) configValidator() ConfigValidator {
+	if r.ConfigValidator == nil {
+		return NoopConfigValidator{}
+	}
+
+	return r.ConfigValidator
+}
+
+func buildConfigSecretData(instance *proxyv1alpha1.Instance, config string, certificates map[string]string, envs []string, mappings map[string]string, errorFiles map[string]string, customCerts map[string]string, aclValueFiles map[string]string) map[string][]byte {
+	data := map[string][]byte{
+		filepath.Base(haproxy.DefaultConfigurationFile): []byte(config),
+	}
+
+	if hasLocalLoggingTarget(instance) {
+		data["rsyslog.conf"] = []byte(fmt.Sprintf(utils.RsyslogConfigFormat, instance.Spec.Configuration.Global.Logging.Address))
+	}
+
+	for file, certificate := range certificates {
+		data[filepath.Base(file)] = []byte(certificate)
+	}
+
+	if len(envs) > 0 {
+		data["env"] = []byte(strings.Join(envs, "/n"))
+	}
+
+	for file, value := range mappings {
+		data[filepath.Base(file)] = []byte(value)
+	}
+
+	for file, value := range errorFiles {
+		data[filepath.Base(file)] = []byte(value)
+	}
+
+	for file, value := range customCerts {
+		data[filepath.Base(file)] = []byte(value)
+	}
+
+	for file, value := range aclValueFiles {
+		data[filepath.Base(file)] = []byte(value)
+	}
+
+	return data
+}
+
+func (r *Reconciler) markRelatedConfigError(ctx context.Context, instance *proxyv1alpha1.Instance, listens *configv1alpha1.ListenList, frontends *configv1alpha1.FrontendList, backends *configv1alpha1.BackendList, resolvers *configv1alpha1.ResolverList, rootErr error) error {
+	if rootErr == nil {
+		return nil
+	}
+
+	changed := false
+
+	for i := range listens.Items {
+		if listens.Items[i].Status.Phase != configv1alpha1.StatusPhaseError || listens.Items[i].Status.Error != rootErr.Error() {
+			listens.Items[i].Status.Phase = configv1alpha1.StatusPhaseError
+			listens.Items[i].Status.Error = rootErr.Error()
+			changed = true
+		}
+	}
+
+	for i := range frontends.Items {
+		if frontends.Items[i].Status.Phase != configv1alpha1.StatusPhaseError || frontends.Items[i].Status.Error != rootErr.Error() {
+			frontends.Items[i].Status.Phase = configv1alpha1.StatusPhaseError
+			frontends.Items[i].Status.Error = rootErr.Error()
+			changed = true
+		}
+	}
+
+	for i := range backends.Items {
+		if backends.Items[i].Status.Phase != configv1alpha1.StatusPhaseError || backends.Items[i].Status.Error != rootErr.Error() {
+			backends.Items[i].Status.Phase = configv1alpha1.StatusPhaseError
+			backends.Items[i].Status.Error = rootErr.Error()
+			changed = true
+		}
+	}
+
+	for i := range resolvers.Items {
+		if resolvers.Items[i].Status.Phase != configv1alpha1.StatusPhaseError || resolvers.Items[i].Status.Error != rootErr.Error() {
+			resolvers.Items[i].Status.Phase = configv1alpha1.StatusPhaseError
+			resolvers.Items[i].Status.Error = rootErr.Error()
+			changed = true
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	return r.updateConfigResources(ctx, instance, listens, frontends, backends, resolvers, false)
+}
+
+func getValidationState(instance *proxyv1alpha1.Instance, hash string) (string, bool) {
+	if instance == nil || instance.Annotations == nil {
+		return "", false
+	}
+
+	if instance.Annotations[validationHashAnnotationKey] != hash {
+		return "", false
+	}
+
+	return instance.Annotations[validationStateAnnotationKey], true
+}
+
+func getValidationError(instance *proxyv1alpha1.Instance) string {
+	if instance == nil || instance.Annotations == nil {
+		return ""
+	}
+
+	return instance.Annotations[validationErrorAnnotationKey]
+}
+
+func (r *Reconciler) setValidationState(ctx context.Context, instance *proxyv1alpha1.Instance, hash, state, validationErr string) error {
+	if instance == nil {
+		return nil
+	}
+
+	original := instance.DeepCopy()
+	if instance.Annotations == nil {
+		instance.Annotations = map[string]string{}
+	}
+
+	instance.Annotations[validationHashAnnotationKey] = hash
+	instance.Annotations[validationStateAnnotationKey] = state
+
+	if validationErr == "" {
+		delete(instance.Annotations, validationErrorAnnotationKey)
+	} else {
+		instance.Annotations[validationErrorAnnotationKey] = validationErr
+	}
+
+	if reflect.DeepEqual(original.Annotations, instance.Annotations) {
+		return nil
+	}
+
+	return r.Patch(ctx, instance, client.MergeFrom(original))
+}
+
+func (r *Reconciler) clearForcedValidationState(ctx context.Context, instance *proxyv1alpha1.Instance) error {
+	if instance == nil || instance.Annotations == nil || instance.Annotations[forceRevalidationAnnotationKey] != "true" {
+		return nil
+	}
+
+	original := instance.DeepCopy()
+	delete(instance.Annotations, forceRevalidationAnnotationKey)
+	delete(instance.Annotations, validationHashAnnotationKey)
+	delete(instance.Annotations, validationStateAnnotationKey)
+	delete(instance.Annotations, validationErrorAnnotationKey)
+
+	return r.Patch(ctx, instance, client.MergeFrom(original))
 }
 
 // #nosec

@@ -1197,6 +1197,12 @@ Package v1alpha1 contains API Schema definitions for the proxy v1alpha1 API grou
 ### Resource Types
 - [Instance](#instance)
 
+### Configuration Validation
+
+Before the runtime HAProxy configuration Secret is updated, the operator validates the generated configuration. A failed validation sets the `Instance` status phase to `InternalError` and records the validation error. Validation failures do not request an immediate reconciliation retry; a changed configuration triggers validation again.
+
+Set the `proxy.haproxy.com/force-revalidation: "true"` annotation on an `Instance` to discard its cached validation result and validate the current generated configuration again. The annotation is consumed after the cache is cleared. On validation Job failure, the operator logs the associated Pod name for `kubectl logs` inspection. Validation timeouts are recorded as failed validation results. Failed validation Jobs are logged at the `error` level with `job` and `pod` fields. Successful validation Jobs are logged at the `info` level with the message `HAProxy config validation job succeeded` and `job` and `pod` fields; the controller log context includes the `Instance` and namespace.
+
 
 
 #### Configuration
@@ -1578,3 +1584,27 @@ _Appears in:_
 | `annotations` _object (keys:string, values:string)_ | Annotations to be added to Service. |  | Optional: \{\} <br /> |
 
 
+
+## HAProxy Config Precheck Logging
+
+The short-lived configuration validation Job (`haproxy -c`) discards the HAProxy
+process' stdout/stderr; only its exit code determines Job success/failure. No
+HAProxy configuration detail (certificate paths, ACL values, backend addresses,
+line numbers, ...) is written to the Job Pod log.
+
+The Operator only emits the following, unrelated to the check's log content:
+- `level=info` on success: message, `job`, `pod`.
+- `level=error` on failure: message, `job`, `pod`.
+
+`Job.Status.Conditions[].Message` for a failed Job is not propagated into the
+returned validation error; a fixed message (`haproxy config validation job
+failed`) is used instead, since that field could otherwise echo container
+output.
+
+The validation Job is configured with `activeDeadlineSeconds: 120` (2 minutes)
+and `ttlSecondsAfterFinished: 60` (1 minute), ensuring that hung jobs (e.g.,
+stuck in ImagePullBackOff or Pending) are terminated by Kubernetes as `Failed`
+after 2 minutes and automatically cleaned up by the TTL controller.
+
+This behavior is a fixed policy and is not configurable via the `Instance`
+CRD.

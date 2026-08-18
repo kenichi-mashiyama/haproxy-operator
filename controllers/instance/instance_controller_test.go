@@ -2,6 +2,7 @@ package instance_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -25,6 +26,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type fakeConfigValidator struct {
+	err          error
+	observedData map[string][]byte
+	calls        int
+}
+
+func (f *fakeConfigValidator) Validate(_ context.Context, req instance.ConfigValidationRequest) error {
+	f.calls++
+	f.observedData = map[string][]byte{}
+	for key, value := range req.Data {
+		f.observedData[key] = append([]byte(nil), value...)
+	}
+
+	return f.err
+}
 
 var _ = Describe("Reconcile", Label("controller"), func() {
 	Context("Reconcile", func() {
@@ -564,6 +581,67 @@ var _ = Describe("Reconcile", Label("controller"), func() {
 			Ω(cli.Get(ctx, client.ObjectKeyFromObject(proxy), proxy)).ShouldNot(HaveOccurred())
 			Ω(proxy.Status.Phase).Should(Equal(proxyv1alpha1.InstancePhasePending))
 			Ω(proxy.Status.Error).ShouldNot(BeEmpty())
+		})
+		It("should fail before updating config secret when validation fails", func() {
+			cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).WithStatusSubresource(initObjs...).Build()
+			validator := &fakeConfigValidator{err: errors.New("haproxy config validation failed")}
+			r := instance.Reconciler{
+				Client:          cli,
+				Scheme:          scheme,
+				ConfigValidator: validator,
+			}
+
+			result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: proxy.Name, Namespace: proxy.Namespace}})
+			Ω(err).ShouldNot(HaveOccurred())
+			Ω(result.Requeue).Should(BeFalse())
+			Ω(result.RequeueAfter).Should(BeZero())
+
+			Ω(cli.Get(ctx, client.ObjectKeyFromObject(proxy), proxy)).ShouldNot(HaveOccurred())
+			Ω(proxy.Status.Phase).Should(Equal(proxyv1alpha1.InstancePhaseInternalError))
+			Ω(proxy.Status.Error).Should(ContainSubstring("haproxy config validation failed"))
+
+			secret := &corev1.Secret{}
+			err = cli.Get(ctx, client.ObjectKey{Namespace: proxy.Namespace, Name: "bar-foo-haproxy-config"}, secret)
+			Ω(err).Should(HaveOccurred())
+
+			frontendRes := &configv1alpha1.Frontend{}
+			Ω(cli.Get(ctx, client.ObjectKey{Namespace: frontend.Namespace, Name: frontend.Name}, frontendRes)).ShouldNot(HaveOccurred())
+			Ω(frontendRes.Status.Phase).Should(Equal(configv1alpha1.StatusPhaseError))
+			Ω(frontendRes.Status.Error).Should(ContainSubstring("haproxy config validation failed"))
+			Ω(validator.calls).Should(Equal(1))
+		})
+		It("should not re-run validation when failed hash has not changed", func() {
+			cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).WithStatusSubresource(initObjs...).Build()
+			validator := &fakeConfigValidator{err: errors.New("haproxy config validation failed")}
+			r := instance.Reconciler{
+				Client:          cli,
+				Scheme:          scheme,
+				ConfigValidator: validator,
+			}
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: proxy.Name, Namespace: proxy.Namespace}})
+			Ω(err).ShouldNot(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: proxy.Name, Namespace: proxy.Namespace}})
+			Ω(err).ShouldNot(HaveOccurred())
+
+			Ω(validator.calls).Should(Equal(1))
+		})
+		It("should validate the same payload that is written to runtime config secret", func() {
+			cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(initObjs...).WithStatusSubresource(initObjs...).Build()
+			validator := &fakeConfigValidator{}
+			r := instance.Reconciler{
+				Client:          cli,
+				Scheme:          scheme,
+				ConfigValidator: validator,
+			}
+
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: proxy.Name, Namespace: proxy.Namespace}})
+			Ω(err).ShouldNot(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Ω(cli.Get(ctx, client.ObjectKey{Namespace: proxy.Namespace, Name: "bar-foo-haproxy-config"}, secret)).ShouldNot(HaveOccurred())
+			Ω(validator.observedData).Should(Equal(secret.Data))
 		})
 		It("should create custom certs", func() {
 			cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(initObjs, listen)...).WithStatusSubresource(append(initObjs, listen)...).Build()
