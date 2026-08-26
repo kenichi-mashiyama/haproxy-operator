@@ -147,6 +147,32 @@ spec:
                         required:
                         - enabled
                         type: object
+                      options:
+                        description: Options contains additional defaults options.
+                        properties:
+                          dontlogNormal:
+                            description: DontlogNormal controls logging of normal
+                              traffic.
+                            type: boolean
+                          dontlognull:
+                            description: Dontlognull controls logging of null connections.
+                            type: boolean
+                          httpLogClf:
+                            description: HTTPLogCLF enables HTTP logging in CLF format.
+                            type: boolean
+                          logHealthChecks:
+                            description: LogHealthChecks enables logging of health
+                              checks.
+                            type: boolean
+                          logSeparateErrors:
+                            description: LogSeparateErrors causes error and normal
+                              logs to be emitted separately.
+                            type: boolean
+                          redispatch:
+                            description: Redispatch enables or disables redispatching
+                              in defaults.
+                            type: boolean
+                        type: object
                       mode:
                         default: http
                         description: Mode can be either 'tcp' or 'http'. In tcp mode

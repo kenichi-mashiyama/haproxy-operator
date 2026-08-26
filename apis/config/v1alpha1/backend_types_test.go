@@ -68,6 +68,18 @@ var _ = Describe("Backend", Label("type"), func() {
 			Ω(backend.AddToParser(p)).ShouldNot(HaveOccurred())
 			Ω(p.String()).Should(ContainSubstring("option redispatch"))
 		})
+		It("should set option log-health-checks", func() {
+			backend := &configv1alpha1.Backend{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: configv1alpha1.BackendSpec{
+					Options: &configv1alpha1.BackendOptions{
+						LogHealthChecks: ptr.To(true),
+					},
+				},
+			}
+			Ω(backend.AddToParser(p)).ShouldNot(HaveOccurred())
+			Ω(p.String()).Should(ContainSubstring("option log-health-checks"))
+		})
 		It("should set hash-type", func() {
 			backend := &configv1alpha1.Backend{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
